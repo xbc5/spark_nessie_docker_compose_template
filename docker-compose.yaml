@@ -1,0 +1,187 @@
+services:
+  nessie:
+    # IMPORTANT: when upgrading Nessie images, make sure to update the spark-sql packages as well
+    image: ghcr.io/projectnessie/nessie:0.103.5
+    container_name: datastack-example-nessie
+    ports:
+      # API port
+      - "19120:19120"
+      # Management port (metrics and HEALTH CHECKS);
+      # if you change this, you MUST also change the health check, and the management port option.
+      - "9003:9003"
+    depends_on:
+      minio:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      # Debug
+      #- quarkus.log.console.level=DEBUG
+      #- quarkus.log.category."io.smallrye.config".level=DEBUG
+
+      # Net
+      # We changed it from the default port of 9000 to avoid MinIO conflict.
+      # This is also the target for health checks.
+      - quarkus.management.port=9003
+
+      # Catalogue.
+      - nessie.catalog.secrets.access-key.name=minio
+      - nessie.catalog.secrets.access-key.secret=miniosecret
+      # Postgres
+      - nessie.version.store.type=JDBC
+      - nessie.version.store.persist.jdbc.datasource=postgresql
+      - quarkus.datasource.postgresql.jdbc.url=jdbc:postgresql://postgres:5432/catalog
+      - quarkus.datasource.postgresql.username=postgres
+      - quarkus.datasource.postgresql.password=postgres
+
+      # Object store settings.
+      # MinIO
+      - nessie.catalog.default-warehouse=warehouse
+      - nessie.catalog.warehouses.warehouse.location=s3://lakehouse/
+      - nessie.catalog.service.s3.default-options.endpoint=http://minio:9000/
+      - nessie.catalog.service.s3.default-options.region=us-east-1
+      - nessie.catalog.service.s3.default-options.path-style-access=true
+      - nessie.catalog.service.s3.default-options.access-key=urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
+
+      # Authorization settings.
+      - nessie.server.authorization.enabled=false
+    healthcheck:
+      # This port must be the MANAGEMENT PORT.
+      test: ["CMD", "curl", "-f", "http://localhost:9003/q/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 15
+
+  nessie-cli:
+    image: ghcr.io/projectnessie/nessie-cli:0.103.5
+    container_name: datastack-example-nessie-cli
+    depends_on:
+      nessie:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    command:
+      [
+        --uri,
+        "http://nessie:19120/iceberg/main",
+        --client-option,
+        "nessie.enable-api-compatibility-check=false",
+        --client-option,
+        "uri=http://nessie:19120/iceberg/main",
+      ]
+
+  # To store the Nessie catalogue.
+  postgres:
+    image: postgres:17.4
+    container_name: datastack-example-postgres
+    ports:
+      - "5432:5432"
+    # set shared memory limit when using docker-compose
+    shm_size: 128mb
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: catalog
+      POSTGRES_INITDB_ARGS: "--encoding UTF8 --data-checksums"
+    volumes:
+      - "datastack-example-postgres-data:/var/lib/postgresql/data"
+    # /docker-entrypoint-initdb.d
+    healthcheck:
+      test: "pg_isready -U postgres"
+      interval: 5s
+      timeout: 2s
+      retries: 15
+
+  minio:
+    image: docker.io/bitnami/minio:2025
+    container_name: datastack-example-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_DEFAULT_BUCKETS: "lakehouse:public" # Conditionally creates these at startup.
+      MINIO_ROOT_USER: minio # The default.
+      MINIO_ROOT_PASSWORD: miniosecret # The default; must be >8 chars
+      BITNAMI_DEBUG: true
+    volumes:
+      - "datastack-example-lakehouse:/bitnami/minio/data"
+    healthcheck:
+      test: "mc ready local"
+      interval: 5s
+      timeout: 2s
+      retries: 4
+
+  # Manages the Spark cluster. Cluster nodes must point to this.
+  spark-master:
+    image: apache/spark:3.5.5-java17-python3
+    container_name: datastack-example-spark-master
+    command:
+      ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    ports:
+      - "8080:8080" # Spark UI
+      - "7070:7070"
+    healthcheck:
+      test: "curl -I localhost:8080"
+      interval: 5s
+      retries: 15
+
+  spark-worker:
+    build:
+      # We will include our own scripts to process data, so we need to create our own image.
+      # We also need to create ~/.ivy2 to cache downloaded jars.
+      context: ./spark/
+      args:
+        SPARK_TAG: 3.5.5-java17-python3
+        # Coordinates for the necessary packages.
+        NESSIE_COORD: "org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:0.99.0"
+        ICEBERG_COORD: "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.0"
+        AWSSDK_COORD: "software.amazon.awssdk:bundle:2.28.17"
+        AWS_URL_CONN_COORD: software.amazon.awssdk:url-connection-client:2.28.17
+    container_name: datastack-example-spark-worker
+    depends_on:
+      nessie:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    ports:
+      - "4040-4045:4040-4045"
+    healthcheck:
+      test: "curl -I localhost:4040"
+      interval: 5s
+      retries: 15
+    command: [
+        /opt/spark/bin/spark-sql,
+
+        # "--packages",
+        # "org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:0.99.0,org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.0,software.amazon.awssdk:bundle:2.28.17,software.amazon.awssdk:url-connection-client:2.28.17",
+
+        # Point to the master node.
+        "--conf",
+        "spark.master=spark://spark-master:7077",
+
+        --conf,
+        "spark.sql.extensions=org.projectnessie.spark.extensions.NessieSparkSessionExtensions,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+        --conf,
+        "spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog",
+        --conf,
+        "spark.sql.catalog.nessie.type=rest",
+        --conf,
+        "spark.sql.catalog.nessie.uri=http://nessie:19120/iceberg/main",
+        --conf,
+        "spark.sql.catalog.nessie.credential=nessie:nessiesecret",
+        --conf,
+        "spark.sql.catalog.nessie.scope=catalog sign",
+        --conf,
+        "spark.sql.catalogImplementation=in-memory",
+      ]
+    # volumes:
+    #   # The installed --packages go into ~/.ivy2/cache. Since the container downloads them on boot,
+    #   # we need to cache them between sessions.
+    #   - datastack-example-spark-ivy:/root/.ivy2
+
+# Remains intact after container deletion.
+volumes:
+  datastack-example-lakehouse:
+  datastack-example-postgres-data:

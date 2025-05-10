@@ -1,0 +1,23 @@
+[env]
+# Creates an alias for the MinIO client called "datastack", and points it to localhost.
+# The MinIO client is part of the same image as the service. Bitnami bundles it.
+MC_ALIAS_datastack = 'http://localhost:9000'
+MINIO_SERVER_ROOT_USER = 'minio'
+MINIO_SERVER_ROOT_PASSWORD = 'miniosecret'
+MINIO_SERVER_HOST = 'localhost' # Where the server is (for the client.)
+
+[tasks.up]
+description = 'Bring the stack up.'
+run = 'docker compose up -d --scale nessie-cli=0'
+
+[tasks.down]
+description = 'Bring the stack down.'
+run = 'docker compose down'
+
+[tasks.mc]
+description = 'Run the MinIO client command: mc'
+run = 'docker compose exec datastack-example-minio mc'
+
+[tasks.nessie-cli]
+description = 'Run the Nessie CLI.'
+run = 'docker compose run nessie-cli'
