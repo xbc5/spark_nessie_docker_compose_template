@@ -19,7 +19,7 @@ download_url = (
     f"{artifact}-{version}.jar"
 )
 
-# Download to /opt/spark/jars
+# Download.
 subprocess.run(
     [
         "wget",
@@ -30,5 +30,3 @@ subprocess.run(
     ],
     check=True,
 )
-
-print(f"Installed: {maven_coord}")
