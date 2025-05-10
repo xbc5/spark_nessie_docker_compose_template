@@ -6,9 +6,6 @@ import subprocess
 maven_coord = sys.argv[1]
 jar_dir = sys.argv[2]
 
-print(maven_coord)
-print(jar_dir)
-
 # Split it up.
 group, artifact, version = maven_coord.split(":")
 
