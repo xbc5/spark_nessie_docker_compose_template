@@ -1,4 +1,7 @@
 services:
+  ####################################################################
+  #                              NESSIE                              #
+  ####################################################################
   nessie:
     # IMPORTANT: when upgrading Nessie images, make sure to update the spark-sql packages as well
     image: ghcr.io/projectnessie/nessie:0.103.5
@@ -20,38 +23,57 @@ services:
       #- quarkus.log.category."io.smallrye.config".level=DEBUG
 
       # Net
-      # We changed it from the default port of 9000 to avoid MinIO conflict.
-      # This is also the target for health checks.
+      # - Quarkus hosts its own HTTP server to serve all management and application endpoints[2].
+      # - We changed it from the default port of 9000 to avoid MinIO conflict.
+      # - This is also the target for health checks.
+      # management.port: https://web.archive.org/web/20250517002256/https://quarkus.io/guides/all-config#quarkus-vertx-http_quarkus-management-port
       - quarkus.management.port=9003
 
       # Catalogue.
-      - nessie.catalog.secrets.access-key.name=minio
-      - nessie.catalog.secrets.access-key.secret=miniosecret
       # Postgres
       - nessie.version.store.type=JDBC
       - nessie.version.store.persist.jdbc.datasource=postgresql
+      # Quarkus is a framework, and it uses a polymorphic database interface (i.e., JDBC).
+      # See the JDBC options[3][4] for details.
       - quarkus.datasource.postgresql.jdbc.url=jdbc:postgresql://postgres:5432/catalog
       - quarkus.datasource.postgresql.username=postgres
       - quarkus.datasource.postgresql.password=postgres
 
-      # Object store settings.
-      # MinIO
+      # MINIO
+      # --------------------------------------------------------------
       - nessie.catalog.default-warehouse=warehouse
       - nessie.catalog.warehouses.warehouse.location=s3://lakehouse/
       - nessie.catalog.service.s3.default-options.endpoint=http://minio:9000/
       - nessie.catalog.service.s3.default-options.region=us-east-1
+      #
+      # SECRETS
+      # This uses the "basic" secret type (name and secret). The first two lines set the secret into a variable,
+      # any variable, with a "name" and "secret" suffix[0].
+      # The next (3rd) line consumes it via the URN notation: urn:nessie-secret:quarkus:foo[0]
+      # All secrets go through Quarkus (and URN); no matter if it's basic, token, or a key[0].
+      - nessie.catalog.secrets.access-key.name=minio # foo.name: The "basic" secret type[0].
+      - nessie.catalog.secrets.access-key.secret=miniosecret # foo.secret: The "basic" secret type[0].
+      # Now consume the basic secret type via Quarkus[0].
+      - nessie.catalog.service.s3.default-options.access-key=urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key # URN which references the "basic" secret values[0].
+      #
+      # MISC
+      # path-style-access (true) is, e.g., "https://domain/bucket", otherwise it's a virtual host style. e.g. "http://bucket.domain"[1].
       - nessie.catalog.service.s3.default-options.path-style-access=true
-      - nessie.catalog.service.s3.default-options.access-key=urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
 
       # Authorization settings.
+      # --------------------------------------------------------------
       - nessie.server.authorization.enabled=false
     healthcheck:
       # This port must be the MANAGEMENT PORT.
-      test: ["CMD", "curl", "-f", "http://localhost:9003/q/health"]
+      # See references[3] for the correct health check URL.
+      test: ["CMD", "curl", "-f", "http://localhost:9003/q/health/ready"]
       interval: 5s
       timeout: 2s
       retries: 15
 
+  ####################################################################
+  #                            NESSIE CLI                            #
+  ####################################################################
   nessie-cli:
     image: ghcr.io/projectnessie/nessie-cli:0.103.5
     container_name: datastack-example-nessie-cli
@@ -70,6 +92,9 @@ services:
         "uri=http://nessie:19120/iceberg/main",
       ]
 
+  ####################################################################
+  #                             POSTGRES                             #
+  ####################################################################
   # To store the Nessie catalogue.
   postgres:
     image: postgres:17.4
@@ -92,6 +117,9 @@ services:
       timeout: 2s
       retries: 15
 
+  ####################################################################
+  #                              MINIO                               #
+  ####################################################################
   minio:
     image: docker.io/bitnami/minio:2025
     container_name: datastack-example-minio
@@ -111,6 +139,9 @@ services:
       timeout: 2s
       retries: 4
 
+  ####################################################################
+  #                              SPARK                               #
+  ####################################################################
   # Manages the Spark cluster. Cluster nodes must point to this.
   spark-master:
     image: apache/spark:3.5.5-java17-python3
@@ -132,10 +163,21 @@ services:
       context: ./spark/
       args:
         SPARK_TAG: 3.5.5-java17-python3
+        # PACKAGES
+        # -----------------------------------------------------------
         # Coordinates for the necessary packages.
+        # The Dockerfile uses a script to install these jars at build time, so go read that.
+        #
+        # Contains the SQL extensions that allow us to manage tables via Nessie's git like interface[6].
         NESSIE_COORD: "org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:0.99.0"
+        #
+        # This includes all Iceberg libraries necessary to run--including the Nessie catalog[6].
         ICEBERG_COORD: "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.0"
+        #
+        #
         AWSSDK_COORD: "software.amazon.awssdk:bundle:2.28.17"
+        #
+        #
         AWS_URL_CONN_COORD: software.amazon.awssdk:url-connection-client:2.28.17
     container_name: datastack-example-spark-worker
     depends_on:
@@ -154,34 +196,97 @@ services:
     command: [
         /opt/spark/bin/spark-sql,
 
+        # -----------------------------------------------------------
         # "--packages",
-        # "org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:0.99.0,org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.0,software.amazon.awssdk:bundle:2.28.17,software.amazon.awssdk:url-connection-client:2.28.17",
+        # ... Instead of installing packages here--which installs them at runtime--I created
+        # ... a script to install them at build time. See `args` and the Dockerfile.
 
         # Point to the master node.
+        # -----------------------------------------------------------
         "--conf",
         "spark.master=spark://spark-master:7077",
 
+        # OTHER CONF
+        # -----------------------------------------------------------
+        # spark.sql.extensions:
+        #   A list of classes that implement SparkSessionExtensions[5]. The "org.projectnessie.nessie-integrations:nessie-spark-extensions"
+        #   implements this, and extends the SparkSession extension object.
         --conf,
         "spark.sql.extensions=org.projectnessie.spark.extensions.NessieSparkSessionExtensions,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+        #
+        # NESSIE
+        # -----------------------------------------------------------
+        # -- MANDATORY CONFIG[7] --
+        #
+        # This maps the v2 interface to Sparks internal v1 API[5]; it essentially specifies the
+        # public API that you will consume with queries[9].
+        #
+        # It also creates the (arbitrary) "nessie" identifier. All subsequent Nessie configuration values
+        # should now use the "nessie" key.
+        #
+        # spark.sql.catalog.<arbitrary_catalog_name>[7].
+        # - This MUST be "org.apache.iceberg.spark.SparkCatalog"[7];
         --conf,
         "spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog",
+        #
+        # This tells spark to use Nessie's catalog as the backend implementation[7]. The public API wraps this.
         --conf,
-        "spark.sql.catalog.nessie.type=rest",
+        "spark.sql.catalog.nessie.catalog-impl=org.apache.iceberg.nessie.NessieCatalog",
+        #
+        # The location of the Nessie server[7].
         --conf,
         "spark.sql.catalog.nessie.uri=http://nessie:19120/iceberg/main",
+        #
+        # The default Nessie branch that the Iceberg catalog will use[7].
         --conf,
-        "spark.sql.catalog.nessie.credential=nessie:nessiesecret",
+        "spark.sql.catalog.nessie.ref=main",
+        #
+        # The location where to store the Iceberg tables managed by the Nessie catalog[7].
         --conf,
-        "spark.sql.catalog.nessie.scope=catalog sign",
+        "spark.sql.catalog.nessie.warehouse=lakehouse",
+        #
+        # Set to NONE by default. Commented because I don't think that we need it.
+        # --conf, "spark.sql.catalog.nessie.authentication.type=NONE",
+        #
+        # -- OPTIONAL CONFIG[7] --
+        #
+        # This informs Nessie that it should use its REST catalogue,
+        # which is an implementation of Apache Iceberg's REST specification.
+        # [I think that the NessieCatalog catalog-impl will set this]
+        --conf,
+        "spark.sql.catalog.nessie.type=rest",
+        #
+        #
+        # --conf,
+        # "spark.sql.catalog.nessie.credential=nessie:nessiesecret",
+        #
+        # --conf,
+        # "spark.sql.catalog.nessie.scope=catalog sign",
+        #
+        # Define where and how meta data is stored--i.e., the "default external catalogue implementation"[10]. It can be one of:
+        # - in-memory: Ephemeral, and available only through the Spark session object[8]. Generally good enough.
+        # - hive: Permanent. Stored via a Hive Metastore, which can contain multipl catalogues[8]. Good for complex setupes (resuming sessions etc.)
         --conf,
         "spark.sql.catalogImplementation=in-memory",
       ]
-    # volumes:
-    #   # The installed --packages go into ~/.ivy2/cache. Since the container downloads them on boot,
-    #   # we need to cache them between sessions.
-    #   - datastack-example-spark-ivy:/root/.ivy2
 
 # Remains intact after container deletion.
 volumes:
-  datastack-example-lakehouse:
-  datastack-example-postgres-data:
+  datastack-example-lakehouse: # Stores data.
+  datastack-example-postgres-data: # Catalogue.
+#
+#
+######################################################################
+#                             REFERENCES                             #
+######################################################################
+# [0]  Secrets manager settings: https://web.archive.org/web/20250516030734/https://projectnessie.org/nessie-latest/configuration/#secrets-manager-settings
+# [1]  S3 bucket settings: https://web.archive.org/web/20250516204111/https://projectnessie.org/nessie-latest/configuration/#s3-settings
+# [2]  Quarkus management interface reference: https://web.archive.org/web/20250517003510/https://quarkus.io/guides/management-interface-reference
+# [3]  Quarkus JDBC option: https://web.archive.org/web/20250517002325/https://quarkus.io/guides/all-config#quarkus-agroal_quarkus-datasource-jdbc
+# [4]  Quarkus jdbc.url option: https://web.archive.org/web/20250517002401/https://quarkus.io/guides/all-config#quarkus-agroal_quarkus-datasource-jdbc-url
+# [5]  Spark SQL config options: https://web.archive.org/web/20250517031032/https://spark.apache.org/docs/latest/configuration.html#spark-sql
+# [6]  Nessie + Iceberg + Spark guide: https://web.archive.org/web/20250517034953/https://projectnessie.org/iceberg/spark/
+# [7]  Nessie + Iceberg + Spark guide/configuration: https://web.archive.org/web/20250517034953/https://projectnessie.org/iceberg/spark/#configuration
+# [8]  catalogImplementation types (Hive, in-memory): https://stackoverflow.com/a/65202915
+# [9]  AI
+# [10] catalogImplementation: https://stackoverflow.com/a/48171845
